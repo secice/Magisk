@@ -1,52 +1,15 @@
-##########################################################################################
+############################################
 #
 # Magisk General Utility Functions
 # by topjohnwu
 #
-# Used everywhere in Magisk
-#
-##########################################################################################
+############################################
 
 #MAGISK_VERSION_STUB
 
-# Detect whether in boot mode
-[ -z $BOOTMODE ] && BOOTMODE=false
-$BOOTMODE || ps | grep zygote | grep -qv grep && BOOTMODE=true
-$BOOTMODE || ps -A | grep zygote | grep -qv grep && BOOTMODE=true
-
-# Presets
-MAGISKTMP=/sbin/.magisk
-[ -z $NVBASE ] && NVBASE=/data/adb
-[ -z $MAGISKBIN ] && MAGISKBIN=$NVBASE/magisk
-[ -z $IMG ] && IMG=$NVBASE/magisk.img
-
-# Bootsigner related stuff
-BOOTSIGNERCLASS=a.a
-BOOTSIGNER="/system/bin/dalvikvm -Xnodex2oat -Xnoimage-dex2oat -cp \$APK \$BOOTSIGNERCLASS"
-BOOTSIGNED=false
-
-setup_flashable() {
-  $BOOTMODE && return
-  # Preserve environment varibles
-  OLD_PATH=$PATH
-  setup_bb
-  if [ -z $OUTFD ] || readlink /proc/$$/fd/$OUTFD | grep -q /tmp; then
-    # We will have to manually find out OUTFD
-    for FD in `ls /proc/$$/fd`; do
-      if readlink /proc/$$/fd/$FD | grep -q pipe; then
-        if ps | grep -v grep | grep -q " 3 $FD "; then
-          OUTFD=$FD
-          break
-        fi
-      fi
-    done
-  fi
-}
-
-# Backward compatibility
-get_outfd() {
-  setup_flashable
-}
+###################
+# Helper Functions
+###################
 
 ui_print() {
   $BOOTMODE && echo "$1" || echo -e "ui_print $1\nui_print" >> /proc/self/fd/$OUTFD
@@ -54,87 +17,6 @@ ui_print() {
 
 toupper() {
   echo "$@" | tr '[:lower:]' '[:upper:]'
-}
-
-find_block() {
-  for BLOCK in "$@"; do
-    DEVICE=`find /dev/block -type l -iname $BLOCK | head -n 1` 2>/dev/null
-    if [ ! -z $DEVICE ]; then
-      readlink -f $DEVICE
-      return 0
-    fi
-  done
-  # Fallback by parsing sysfs uevents
-  for uevent in /sys/dev/block/*/uevent; do
-    local DEVNAME=`grep_prop DEVNAME $uevent`
-    local PARTNAME=`grep_prop PARTNAME $uevent`
-    for p in "$@"; do
-      if [ "`toupper $p`" = "`toupper $PARTNAME`" ]; then
-        echo /dev/block/$DEVNAME
-        return 0
-      fi
-    done
-  done
-  return 1
-}
-
-mount_partitions() {
-  # Check A/B slot
-  SLOT=`grep_cmdline androidboot.slot_suffix`
-  if [ -z $SLOT ]; then
-    SLOT=_`grep_cmdline androidboot.slot`
-    [ $SLOT = "_" ] && SLOT=
-  fi
-  [ -z $SLOT ] || ui_print "- Current boot slot: $SLOT"
-
-  ui_print "- Mounting /system, /vendor"
-  [ -f /system/build.prop ] || is_mounted /system || mount -o ro /system 2>/dev/null
-  if ! is_mounted /system && ! [ -f /system/build.prop ]; then
-    SYSTEMBLOCK=`find_block system$SLOT`
-    mount -t ext4 -o ro $SYSTEMBLOCK /system
-  fi
-  [ -f /system/build.prop ] || is_mounted /system || abort "! Cannot mount /system"
-  grep -qE '/dev/root|/system_root' /proc/mounts && SYSTEM_ROOT=true || SYSTEM_ROOT=false
-  if [ -f /system/init ]; then
-    SYSTEM_ROOT=true
-    mkdir /system_root 2>/dev/null
-    mount --move /system /system_root
-    mount -o bind /system_root/system /system
-  fi
-  if [ -L /system/vendor ]; then
-    # Seperate /vendor partition
-    is_mounted /vendor || mount -o ro /vendor 2>/dev/null
-    if ! is_mounted /vendor; then
-      VENDORBLOCK=`find_block vendor$SLOT`
-      mount -t ext4 -o ro $VENDORBLOCK /vendor
-    fi
-    is_mounted /vendor || abort "! Cannot mount /vendor"
-  fi
-}
-
-get_flags() {
-  # override variables
-  getvar KEEPVERITY
-  getvar KEEPFORCEENCRYPT
-  if [ -z $KEEPVERITY ]; then
-    if $SYSTEM_ROOT; then
-      KEEPVERITY=true
-      ui_print "- Using system_root_image, keep dm/avb-verity"
-    else
-      KEEPVERITY=false
-    fi
-  fi
-  if [ -z $KEEPFORCEENCRYPT ]; then
-    grep ' /data ' /proc/mounts | grep -q 'dm-' && FDE=true || FDE=false
-    [ -d /data/unencrypted ] && FBE=true || FBE=false
-    # No data access means unable to decrypt in recovery
-    if $FDE || $FBE || ! $DATA; then
-      KEEPFORCEENCRYPT=true
-      ui_print "- Encrypted data detected, keep forceencrypt"
-    else
-      KEEPFORCEENCRYPT=false
-    fi
-  fi
 }
 
 grep_cmdline() {
@@ -152,46 +34,361 @@ grep_prop() {
 
 getvar() {
   local VARNAME=$1
-  local VALUE=
-  VALUE=`grep_prop $VARNAME /sbin/.magisk/config /.backup/.magisk /data/.magisk /cache/.magisk`
+  local VALUE
+  local PROPPATH='/data/.magisk /cache/.magisk'
+  [ -n $MAGISKTMP ] && PROPPATH="$MAGISKTMP/config $PROPPATH"
+  VALUE=$(grep_prop $VARNAME $PROPPATH)
   [ ! -z $VALUE ] && eval $VARNAME=\$VALUE
 }
 
-run_migrations() {
-  # Update the broken boot backup
-  if [ -f /data/stock_boot_.img.gz ]; then
-    $MAGISKBIN/magiskboot --decompress /data/stock_boot_.img.gz /data/stock_boot.img
+is_mounted() {
+  grep -q " `readlink -f $1` " /proc/mounts 2>/dev/null
+  return $?
+}
+
+abort() {
+  ui_print "$1"
+  $BOOTMODE || recovery_cleanup
+  [ -n $MODPATH ] && rm -rf $MODPATH
+  rm -rf $TMPDIR
+  exit 1
+}
+
+resolve_vars() {
+  MAGISKBIN=$NVBASE/magisk
+  POSTFSDATAD=$NVBASE/post-fs-data.d
+  SERVICED=$NVBASE/service.d
+}
+
+print_title() {
+  local len line1len line2len pounds
+  line1len=$(echo -n $1 | wc -c)
+  line2len=$(echo -n $2 | wc -c)
+  [ $line1len -gt $line2len ] && len=$line1len || len=$line2len
+  len=$((len + 2))
+  pounds=$(printf "%${len}s" | tr ' ' '*')
+  ui_print "$pounds"
+  ui_print " $1 "
+  [ "$2" ] && ui_print " $2 "
+  ui_print "$pounds"
+}
+
+######################
+# Environment Related
+######################
+
+setup_flashable() {
+  ensure_bb
+  $BOOTMODE && return
+  if [ -z $OUTFD ] || readlink /proc/$$/fd/$OUTFD | grep -q /tmp; then
+    # We will have to manually find out OUTFD
+    for FD in `ls /proc/$$/fd`; do
+      if readlink /proc/$$/fd/$FD | grep -q pipe; then
+        if ps | grep -v grep | grep -qE " 3 $FD |status_fd=$FD"; then
+          OUTFD=$FD
+          break
+        fi
+      fi
+    done
   fi
-  # Update our previous backup to new format if exists
-  if [ -f /data/stock_boot.img ]; then
-    ui_print "- Migrating boot image backup"
-    SHA1=`$MAGISKBIN/magiskboot --sha1 /data/stock_boot.img 2>/dev/null`
-    STOCKDUMP=/data/stock_boot_${SHA1}.img
-    mv /data/stock_boot.img $STOCKDUMP
-    $MAGISKBIN/magiskboot --compress $STOCKDUMP
+}
+
+ensure_bb() {
+  if set -o | grep -q standalone; then
+    # We are definitely in busybox ash
+    set -o standalone
+    return
   fi
-  # Move the stock backups
-  if [ -f /data/magisk/stock_boot* ]; then
-    mv /data/magisk/stock_boot* /data 2>/dev/null
+
+  # Find our busybox binary
+  local bb
+  if [ -f $TMPDIR/busybox ]; then
+    bb=$TMPDIR/busybox
+  elif [ -f $MAGISKBIN/busybox ]; then
+    bb=$MAGISKBIN/busybox
+  else
+    abort "! Cannot find BusyBox"
   fi
-  if [ -f /data/adb/magisk/stock_boot* ]; then
-    mv /data/adb/magisk/stock_boot* /data 2>/dev/null
+  chmod 755 $bb
+
+  # Find our current arguments
+  # Run in busybox environment to ensure consistent results
+  # /proc/<pid>/cmdline shall be <interpreter> <script> <arguments...>
+  local cmds=$($bb sh -o standalone -c "
+  for arg in \$(tr '\0' '\n' < /proc/$$/cmdline); do
+    if [ -z \"\$cmds\" ]; then
+      # Skip the first argument as we want to change the interpreter
+      cmds=\"sh -o standalone\"
+    else
+      cmds=\"\$cmds '\$arg'\"
+    fi
+  done
+  echo \$cmds")
+
+  # Re-exec our script
+  echo $cmds | $bb xargs $bb
+  exit
+}
+
+recovery_actions() {
+  # Make sure random won't get blocked
+  mount -o bind /dev/urandom /dev/random
+  # Unset library paths
+  OLD_LD_LIB=$LD_LIBRARY_PATH
+  OLD_LD_PRE=$LD_PRELOAD
+  OLD_LD_CFG=$LD_CONFIG_FILE
+  unset LD_LIBRARY_PATH
+  unset LD_PRELOAD
+  unset LD_CONFIG_FILE
+}
+
+recovery_cleanup() {
+  local DIR
+  ui_print "- Unmounting partitions"
+  (umount_apex
+  if [ ! -d /postinstall/tmp ]; then
+    umount -l /system
+    umount -l /system_root
   fi
-  # Remove old dbs
-  rm -f /data/user*/*/magisk.db
-  [ -L /data/magisk.img ] || mv /data/magisk.img /data/adb/magisk.img 2>/dev/null
+  umount -l /vendor
+  umount -l /persist
+  for DIR in /apex /system /system_root; do
+    if [ -L "${DIR}_link" ]; then
+      rmdir $DIR
+      mv -f ${DIR}_link $DIR
+    fi
+  done
+  umount -l /dev/random) 2>/dev/null
+  [ -z $OLD_LD_LIB ] || export LD_LIBRARY_PATH=$OLD_LD_LIB
+  [ -z $OLD_LD_PRE ] || export LD_PRELOAD=$OLD_LD_PRE
+  [ -z $OLD_LD_CFG ] || export LD_CONFIG_FILE=$OLD_LD_CFG
+}
+
+#######################
+# Installation Related
+#######################
+
+# find_block [partname...]
+find_block() {
+  local BLOCK DEV DEVICE DEVNAME PARTNAME UEVENT
+  for BLOCK in "$@"; do
+    DEVICE=`find /dev/block \( -type b -o -type c -o -type l \) -iname $BLOCK | head -n 1` 2>/dev/null
+    if [ ! -z $DEVICE ]; then
+      readlink -f $DEVICE
+      return 0
+    fi
+  done
+  # Fallback by parsing sysfs uevents
+  for UEVENT in /sys/dev/block/*/uevent; do
+    DEVNAME=`grep_prop DEVNAME $UEVENT`
+    PARTNAME=`grep_prop PARTNAME $UEVENT`
+    for BLOCK in "$@"; do
+      if [ "$(toupper $BLOCK)" = "$(toupper $PARTNAME)" ]; then
+        echo /dev/block/$DEVNAME
+        return 0
+      fi
+    done
+  done
+  # Look just in /dev in case we're dealing with MTD/NAND without /dev/block devices/links
+  for DEV in "$@"; do
+    DEVICE=`find /dev \( -type b -o -type c -o -type l \) -maxdepth 1 -iname $DEV | head -n 1` 2>/dev/null
+    if [ ! -z $DEVICE ]; then
+      readlink -f $DEVICE
+      return 0
+    fi
+  done
+  return 1
+}
+
+# setup_mntpoint <mountpoint>
+setup_mntpoint() {
+  local POINT=$1
+  [ -L $POINT ] && mv -f $POINT ${POINT}_link
+  if [ ! -d $POINT ]; then
+    rm -f $POINT
+    mkdir -p $POINT
+  fi
+}
+
+# mount_name <partname(s)> <mountpoint> <flag>
+mount_name() {
+  local PART=$1
+  local POINT=$2
+  local FLAG=$3
+  setup_mntpoint $POINT
+  is_mounted $POINT && return
+  ui_print "- Mounting $POINT"
+  # First try mounting with fstab
+  mount $FLAG $POINT 2>/dev/null
+  if ! is_mounted $POINT; then
+    local BLOCK=`find_block $PART`
+    mount $FLAG $BLOCK $POINT
+  fi
+}
+
+# mount_ro_ensure <partname(s)> <mountpoint>
+mount_ro_ensure() {
+  # We handle ro partitions only in recovery
+  $BOOTMODE && return
+  local PART=$1
+  local POINT=$2
+  mount_name "$PART" $POINT '-o ro'
+  is_mounted $POINT || abort "! Cannot mount $POINT"
+}
+
+mount_partitions() {
+  # Check A/B slot
+  SLOT=`grep_cmdline androidboot.slot_suffix`
+  if [ -z $SLOT ]; then
+    SLOT=`grep_cmdline androidboot.slot`
+    [ -z $SLOT ] || SLOT=_${SLOT}
+  fi
+  [ -z $SLOT ] || ui_print "- Current boot slot: $SLOT"
+
+  # Mount ro partitions
+  mount_ro_ensure "system$SLOT app$SLOT" /system
+  if [ -f /system/init -o -L /system/init ]; then
+    SYSTEM_ROOT=true
+    setup_mntpoint /system_root
+    if ! mount --move /system /system_root; then
+      umount /system
+      umount -l /system 2>/dev/null
+      mount_ro_ensure "system$SLOT app$SLOT" /system_root
+    fi
+    mount -o bind /system_root/system /system
+  else
+    grep ' / ' /proc/mounts | grep -qv 'rootfs' || grep -q ' /system_root ' /proc/mounts \
+    && SYSTEM_ROOT=true || SYSTEM_ROOT=false
+  fi
+  # /vendor is used only on some older devices for recovery AVBv1 signing so is not critical if fails
+  [ -L /system/vendor ] && mount_name vendor$SLOT /vendor '-o ro'
+  $SYSTEM_ROOT && ui_print "- Device is system-as-root"
+
+  # Allow /system/bin commands (dalvikvm) on Android 10+ in recovery
+  $BOOTMODE || mount_apex
+
+  # Mount persist partition in recovery
+  if ! $BOOTMODE && [ ! -z $PERSISTDIR ]; then
+    # Try to mount persist
+    PERSISTDIR=/persist
+    mount_name persist /persist
+    if ! is_mounted /persist; then
+      # Fallback to cache
+      mount_name "cache cac" /cache
+      is_mounted /cache && PERSISTDIR=/cache || PERSISTDIR=
+    fi
+  fi
+}
+
+# loop_setup <ext4_img>, sets LOOPDEV
+loop_setup() {
+  unset LOOPDEV
+  local LOOP
+  local MINORX=1
+  [ -e /dev/block/loop1 ] && MINORX=$(stat -Lc '%T' /dev/block/loop1)
+  local NUM=0
+  while [ $NUM -lt 64 ]; do
+    LOOP=/dev/block/loop$NUM
+    [ -e $LOOP ] || mknod $LOOP b 7 $((NUM * MINORX))
+    if losetup $LOOP "$1" 2>/dev/null; then
+      LOOPDEV=$LOOP
+      break
+    fi
+    NUM=$((NUM + 1))
+  done
+}
+
+mount_apex() {
+  $BOOTMODE || [ ! -d /system/apex ] && return
+  local APEX DEST
+  setup_mntpoint /apex
+  for APEX in /system/apex/*; do
+    DEST=/apex/$(basename $APEX .apex)
+    [ "$DEST" == /apex/com.android.runtime.release ] && DEST=/apex/com.android.runtime
+    mkdir -p $DEST 2>/dev/null
+    if [ -f $APEX ]; then
+      # APEX APKs, extract and loop mount
+      unzip -qo $APEX apex_payload.img -d /apex
+      loop_setup apex_payload.img
+      if [ ! -z $LOOPDEV ]; then
+        ui_print "- Mounting $DEST"
+        mount -t ext4 -o ro,noatime $LOOPDEV $DEST
+      fi
+      rm -f apex_payload.img
+    elif [ -d $APEX ]; then
+      # APEX folders, bind mount directory
+      ui_print "- Mounting $DEST"
+      mount -o bind $APEX $DEST
+    fi
+  done
+  export ANDROID_RUNTIME_ROOT=/apex/com.android.runtime
+  export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
+  local APEXRJPATH=/apex/com.android.runtime/javalib
+  local SYSFRAME=/system/framework
+  export BOOTCLASSPATH=\
+$APEXRJPATH/core-oj.jar:$APEXRJPATH/core-libart.jar:$APEXRJPATH/okhttp.jar:\
+$APEXRJPATH/bouncycastle.jar:$APEXRJPATH/apache-xml.jar:$SYSFRAME/framework.jar:\
+$SYSFRAME/ext.jar:$SYSFRAME/telephony-common.jar:$SYSFRAME/voip-common.jar:\
+$SYSFRAME/ims-common.jar:$SYSFRAME/android.test.base.jar:$SYSFRAME/telephony-ext.jar:\
+/apex/com.android.conscrypt/javalib/conscrypt.jar:\
+/apex/com.android.media/javalib/updatable-media.jar
+}
+
+umount_apex() {
+  [ -d /apex ] || return
+  local DEST SRC
+  for DEST in /apex/*; do
+    [ "$DEST" = '/apex/*' ] && break
+    SRC=$(grep $DEST /proc/mounts | awk '{ print $1 }')
+    umount -l $DEST
+    # Detach loop device just in case
+    losetup -d $SRC 2>/dev/null
+  done
+  rm -rf /apex
+  unset ANDROID_RUNTIME_ROOT
+  unset ANDROID_TZDATA_ROOT
+  unset BOOTCLASSPATH
+}
+
+get_flags() {
+  # override variables
+  getvar KEEPVERITY
+  getvar KEEPFORCEENCRYPT
+  getvar RECOVERYMODE
+  if [ -z $KEEPVERITY ]; then
+    if $SYSTEM_ROOT; then
+      KEEPVERITY=true
+      ui_print "- System-as-root, keep dm/avb-verity"
+    else
+      KEEPVERITY=false
+    fi
+  fi
+  if [ -z $KEEPFORCEENCRYPT ]; then
+    grep ' /data ' /proc/mounts | grep -q 'dm-' && FDE=true || FDE=false
+    [ -d /data/unencrypted ] && FBE=true || FBE=false
+    # No data access means unable to decrypt in recovery
+    if $FDE || $FBE || ! $DATA; then
+      KEEPFORCEENCRYPT=true
+      ui_print "- Encrypted data, keep forceencrypt"
+    else
+      KEEPFORCEENCRYPT=false
+    fi
+  fi
+  [ -z $RECOVERYMODE ] && RECOVERYMODE=false
 }
 
 find_boot_image() {
   BOOTIMAGE=
-  if [ ! -z $SLOT ]; then
-    BOOTIMAGE=`find_block boot$SLOT ramdisk$SLOT`
+  if $RECOVERYMODE; then
+    BOOTIMAGE=`find_block recovery_ramdisk$SLOT recovery$SLOT sos`
+  elif [ ! -z $SLOT ]; then
+    BOOTIMAGE=`find_block ramdisk$SLOT recovery_ramdisk$SLOT boot$SLOT`
   else
-    BOOTIMAGE=`find_block boot ramdisk boot_a kern-a android_boot kernel lnx bootimg`
+    BOOTIMAGE=`find_block ramdisk recovery_ramdisk kern-a android_boot kernel bootimg boot lnx boot_a`
   fi
   if [ -z $BOOTIMAGE ]; then
     # Lets see what fstabs tells me
-    BOOTIMAGE=`grep -v '#' /etc/*fstab* | grep -E '/boot[^a-zA-Z]' | grep -oE '/dev/[a-zA-Z0-9_./-]*' | head -n 1`
+    BOOTIMAGE=`grep -v '#' /etc/*fstab* | grep -E '/boot(img)?[^a-zA-Z]' | grep -oE '/dev/[a-zA-Z0-9_./-]*' | head -n 1`
   fi
 }
 
@@ -199,42 +396,68 @@ flash_image() {
   # Make sure all blocks are writable
   $MAGISKBIN/magisk --unlock-blocks 2>/dev/null
   case "$1" in
-    *.gz) COM1="$MAGISKBIN/magiskboot --decompress '$1' - 2>/dev/null";;
-    *)    COM1="cat '$1'";;
+    *.gz) CMD1="$MAGISKBIN/magiskboot decompress '$1' - 2>/dev/null";;
+    *)    CMD1="cat '$1'";;
   esac
   if $BOOTSIGNED; then
-    COM2="$BOOTSIGNER -sign"
-    ui_print "- Sign image with test keys"
+    CMD2="$BOOTSIGNER -sign"
+    ui_print "- Sign image with verity keys"
   else
-    COM2="cat -"
+    CMD2="cat -"
   fi
   if [ -b "$2" ]; then
-    local s_size=`stat -c '%s' "$1"`
-    local t_size=`blockdev --getsize64 "$2"`
-    [ $s_size -gt $t_size ] && return 1
-    eval $COM1 | eval $COM2 | cat - /dev/zero > "$2" 2>/dev/null
+    local img_sz=`stat -c '%s' "$1"`
+    local blk_sz=`blockdev --getsize64 "$2"`
+    [ $img_sz -gt $blk_sz ] && return 1
+    eval $CMD1 | eval $CMD2 | cat - /dev/zero > "$2" 2>/dev/null
+  elif [ -c "$2" ]; then
+    flash_eraseall "$2" >&2
+    eval $CMD1 | eval $CMD2 | nandwrite -p "$2" - >&2
   else
-    ui_print "- Not block device, storing image"
-    eval $COM1 | eval $COM2 > "$2" 2>/dev/null
+    ui_print "- Not block or char device, storing image"
+    eval $CMD1 | eval $CMD2 > "$2" 2>/dev/null
   fi
   return 0
 }
 
-find_dtbo_image() {
-  DTBOIMAGE=`find_block dtbo$SLOT`
-}
+# Common installation script for flash_script.sh and addon.d.sh
+install_magisk() {
+  cd $MAGISKBIN
 
-patch_dtbo_image() {
-  if [ ! -z $DTBOIMAGE ]; then
-    if $MAGISKBIN/magiskboot --dtb-test $DTBOIMAGE; then
-      ui_print "- Backing up stock DTBO image"
-      $MAGISKBIN/magiskboot --compress $DTBOIMAGE $MAGISKBIN/stock_dtbo.img.gz
-      ui_print "- Patching DTBO to remove avb-verity"
-      $MAGISKBIN/magiskboot --dtb-patch $DTBOIMAGE
-      return 0
-    fi
+  # Dump image for MTD/NAND character device boot partitions
+  if [ -c $BOOTIMAGE ]; then
+    nanddump -f boot.img $BOOTIMAGE
+    local BOOTNAND=$BOOTIMAGE
+    BOOTIMAGE=boot.img
   fi
-  return 1
+
+  if [ $API -ge 21 ]; then
+    eval $BOOTSIGNER -verify < $BOOTIMAGE && BOOTSIGNED=true
+    $BOOTSIGNED && ui_print "- Boot image is signed with AVB 1.0"
+  fi
+
+  $IS64BIT && mv -f magiskinit64 magiskinit 2>/dev/null || rm -f magiskinit64
+
+  # Source the boot patcher
+  SOURCEDMODE=true
+  . ./boot_patch.sh "$BOOTIMAGE"
+
+  ui_print "- Flashing new boot image"
+
+  # Restore the original boot partition path
+  [ "$BOOTNAND" ] && BOOTIMAGE=$BOOTNAND
+
+  if ! flash_image new-boot.img "$BOOTIMAGE"; then
+    ui_print "- Compressing ramdisk to fit in partition"
+    ./magiskboot cpio ramdisk.cpio compress
+    ./magiskboot repack "$BOOTIMAGE"
+    flash_image new-boot.img "$BOOTIMAGE" || abort "! Insufficient partition size"
+  fi
+
+  ./magiskboot cleanup
+  rm -f new-boot.img
+
+  run_migrations
 }
 
 sign_chromeos() {
@@ -249,14 +472,10 @@ sign_chromeos() {
   mv new-boot.img.signed new-boot.img
 }
 
-is_mounted() {
-  cat /proc/mounts | grep -q " `readlink -f $1` " 2>/dev/null
-  return $?
-}
-
 remove_system_su() {
   if [ -f /system/bin/su -o -f /system/xbin/su ] && [ ! -f /su/bin/su ]; then
     ui_print "- Removing system installed root"
+    blockdev --setrw /dev/block/mapper/system$SLOT 2>/dev/null
     mount -o rw,remount /system
     # SuperSU
     if [ -e /system/bin/.ext/.su ]; then
@@ -266,7 +485,7 @@ remove_system_su() {
       cd /system/bin
       if [ -e app_process64 ]; then
         ln -sf app_process64 app_process
-      else
+      elif [ -e app_process32 ]; then
         ln -sf app_process32 app_process
       fi
     fi
@@ -275,7 +494,12 @@ remove_system_su() {
     /system/bin/app_process_init /system/bin/su /cache/su /system/lib/libsupol.so /system/lib64/libsupol.so \
     /system/su.d /system/etc/install-recovery.sh /system/etc/init.d/99SuperSUDaemon /cache/install-recovery.sh \
     /system/.supersu /cache/.supersu /data/.supersu \
-    /system/app/Superuser.apk /system/app/SuperSU /cache/Superuser.apk  2>/dev/null
+    /system/app/Superuser.apk /system/app/SuperSU /cache/Superuser.apk
+  elif [ -f /cache/su.img -o -f /data/su.img -o -d /data/adb/su -o -d /data/su ]; then
+    ui_print "- Removing systemless installed root"
+    umount -l /su 2>/dev/null
+    rm -rf /cache/su.img /data/su.img /data/adb/su /data/adb/suhide /data/su /cache/.supersu /data/.supersu \
+    /cache/supersu_install /data/supersu_install
   fi
 }
 
@@ -303,67 +527,69 @@ check_data() {
     # Test if DE storage is writable
     $DATA && [ -d /data/adb ] && touch /data/adb/.rw && rm /data/adb/.rw && DATA_DE=true
   fi
+  $DATA && NVBASE=/data || NVBASE=/cache/data_adb
+  $DATA_DE && NVBASE=/data/adb
+  resolve_vars
 }
 
-setup_bb() {
-  if [ -x $MAGISKTMP/busybox/busybox ]; then
-    # Make sure this path is in the front
-    echo $PATH | grep -q "^$MAGISKTMP/busybox" || export PATH=$MAGISKTMP/busybox:$PATH
-  elif [ -x $TMPDIR/bin/busybox ]; then
-    # Make sure this path is in the front
-    echo $PATH | grep -q "^$TMPDIR/bin" || export PATH=$TMPDIR/bin:$PATH
-  else
-    # Construct the PATH
-    mkdir -p $TMPDIR/bin
-    ln -s $MAGISKBIN/busybox $TMPDIR/bin/busybox
-    $MAGISKBIN/busybox --install -s $TMPDIR/bin
-    export PATH=$TMPDIR/bin:$PATH
+find_manager_apk() {
+  [ -z $APK ] && APK=/data/adb/magisk.apk
+  [ -f $APK ] || APK=/data/magisk/magisk.apk
+  [ -f $APK ] || APK=/data/app/com.topjohnwu.magisk*/*.apk
+  if [ ! -f $APK ]; then
+    DBAPK=`magisk --sqlite "SELECT value FROM strings WHERE key='requester'" 2>/dev/null | cut -d= -f2`
+    [ -z $DBAPK ] && DBAPK=`strings /data/adb/magisk.db | grep 5requester | cut -c11-`
+    [ -z $DBAPK ] || APK=/data/user_de/*/$DBAPK/dyn/*.apk
+    [ -f $APK ] || [ -z $DBAPK ] || APK=/data/app/$DBAPK*/*.apk
   fi
+  [ -f $APK ] || ui_print "! Unable to detect Magisk Manager APK for BootSigner"
 }
 
-boot_actions() {
-  if [ ! -d $MAGISKTMP/mirror/bin ]; then
-    mkdir -p $MAGISKTMP/mirror/bin
-    mount -o bind $MAGISKBIN $MAGISKTMP/mirror/bin
+run_migrations() {
+  local LOCSHA1
+  local TARGET
+  # Legacy app installation
+  local BACKUP=/data/adb/magisk/stock_boot*.gz
+  if [ -f $BACKUP ]; then
+    cp $BACKUP /data
+    rm -f $BACKUP
   fi
-  MAGISKBIN=$MAGISKTMP/mirror/bin
-  setup_bb
+
+  # Legacy backup
+  for gz in /data/stock_boot*.gz; do
+    [ -f $gz ] || break
+    LOCSHA1=`basename $gz | sed -e 's/stock_boot_//' -e 's/.img.gz//'`
+    [ -z $LOCSHA1 ] && break
+    mkdir /data/magisk_backup_${LOCSHA1} 2>/dev/null
+    mv $gz /data/magisk_backup_${LOCSHA1}/boot.img.gz
+  done
+
+  # Stock backups
+  LOCSHA1=$SHA1
+  for name in boot dtb dtbo dtbs; do
+    BACKUP=/data/adb/magisk/stock_${name}.img
+    [ -f $BACKUP ] || continue
+    if [ $name = 'boot' ]; then
+      LOCSHA1=`$MAGISKBIN/magiskboot sha1 $BACKUP`
+      mkdir /data/magisk_backup_${LOCSHA1} 2>/dev/null
+    fi
+    TARGET=/data/magisk_backup_${LOCSHA1}/${name}.img
+    cp $BACKUP $TARGET
+    rm -f $BACKUP
+    gzip -9f $TARGET
+  done
 }
 
-recovery_actions() {
-  # TWRP bug fix
-  mount -o bind /dev/urandom /dev/random
-  # Temporarily block out all custom recovery binaries/libs
-  mv /sbin /sbin_tmp
-  # Unset library paths
-  OLD_LD_LIB=$LD_LIBRARY_PATH
-  OLD_LD_PRE=$LD_PRELOAD
-  unset LD_LIBRARY_PATH
-  unset LD_PRELOAD
-}
-
-recovery_cleanup() {
-  mv /sbin_tmp /sbin 2>/dev/null
-  [ -z $OLD_PATH ] || export PATH=$OLD_PATH
-  [ -z $OLD_LD_LIB ] || export LD_LIBRARY_PATH=$OLD_LD_LIB
-  [ -z $OLD_LD_PRE ] || export LD_PRELOAD=$OLD_LD_PRE
-  ui_print "- Unmounting partitions"
-  umount -l /system_root 2>/dev/null
-  umount -l /system 2>/dev/null
-  umount -l /vendor 2>/dev/null
-  umount -l /dev/random 2>/dev/null
-}
-
-abort() {
-  ui_print "$1"
-  $BOOTMODE || recovery_cleanup
-  exit 1
-}
+#################
+# Module Related
+#################
 
 set_perm() {
   chown $2:$3 $1 || return 1
   chmod $4 $1 || return 1
-  [ -z $5 ] && chcon 'u:object_r:system_file:s0' $1 || chcon $5 $1 || return 1
+  CON=$5
+  [ -z $CON ] && CON=u:object_r:system_file:s0
+  chcon $CON $1 || return 1
 }
 
 set_perm_recursive() {
@@ -382,65 +608,138 @@ mktouch() {
 }
 
 request_size_check() {
-  reqSizeM=`du -ms $1 | cut -f1`
+  reqSizeM=`du -ms "$1" | cut -f1`
 }
 
 request_zip_size_check() {
   reqSizeM=`unzip -l "$1" | tail -n 1 | awk '{ print int(($1 - 1) / 1048576 + 1) }'`
 }
 
-check_filesystem() {
-  curSizeM=`wc -c < $1`
-  curSizeM=$((curSizeM / 1048576))
-  local DF=`df -Pk $2 | grep $2`
-  curUsedM=`echo $DF | awk '{ print int($3 / 1024) }'`
-  curFreeM=`echo $DF | awk '{ print int($4 / 1024) }'`
+boot_actions() { return; }
+
+# Require ZIPFILE to be set
+is_legacy_script() {
+  unzip -l "$ZIPFILE" install.sh | grep -q install.sh
+  return $?
 }
 
-mount_snippet() {
-  MAGISKLOOP=`$MAGISKBIN/magisk imgtool mount $IMG $MOUNTPATH`
-  is_mounted $MOUNTPATH || abort "! $IMG mount failed..."
-}
+# Require OUTFD, ZIPFILE to be set
+install_module() {
+  local PERSISTDIR
+  command -v magisk >/dev/null && PERSISTDIR=$(magisk --path)/mirror/persist
 
-mount_magisk_img() {
-  [ -z reqSizeM ] && reqSizeM=0
-  mkdir -p $MOUNTPATH 2>/dev/null
-  if [ -f "$IMG" ]; then
-    ui_print "- Found $IMG"
-    mount_snippet
-    check_filesystem $IMG $MOUNTPATH
-    if [ $reqSizeM -gt $curFreeM ]; then
-      newSizeM=$(((curSizeM + reqSizeM - curFreeM) / 32 * 32 + 64))
-      ui_print "- Resizing $IMG to ${newSizeM}M"
-      $MAGISKBIN/magisk imgtool umount $MOUNTPATH $MAGISKLOOP
-      $MAGISKBIN/magisk imgtool resize $IMG $newSizeM >&2
-      mount_snippet
-    fi
-    ui_print "- Mount $IMG to $MOUNTPATH"
+  rm -rf $TMPDIR
+  mkdir -p $TMPDIR
+
+  setup_flashable
+  mount_partitions
+  api_level_arch_detect
+
+  # Setup busybox and binaries
+  $BOOTMODE && boot_actions || recovery_actions
+
+  # Extract prop file
+  unzip -o "$ZIPFILE" module.prop -d $TMPDIR >&2
+  [ ! -f $TMPDIR/module.prop ] && abort "! Unable to extract zip file!"
+
+  local MODDIRNAME
+  $BOOTMODE && MODDIRNAME=modules_update || MODDIRNAME=modules
+  local MODULEROOT=$NVBASE/$MODDIRNAME
+  MODID=`grep_prop id $TMPDIR/module.prop`
+  MODNAME=`grep_prop name $TMPDIR/module.prop`
+  MODAUTH=`grep_prop author $TMPDIR/module.prop`
+  MODPATH=$MODULEROOT/$MODID
+
+  # Create mod paths
+  rm -rf $MODPATH 2>/dev/null
+  mkdir -p $MODPATH
+
+  if is_legacy_script; then
+    unzip -oj "$ZIPFILE" module.prop install.sh uninstall.sh 'common/*' -d $TMPDIR >&2
+
+    # Load install script
+    . $TMPDIR/install.sh
+
+    # Callbacks
+    print_modname
+    on_install
+
+    [ -f $TMPDIR/uninstall.sh ] && cp -af $TMPDIR/uninstall.sh $MODPATH/uninstall.sh
+    $SKIPMOUNT && touch $MODPATH/skip_mount
+    $PROPFILE && cp -af $TMPDIR/system.prop $MODPATH/system.prop
+    cp -af $TMPDIR/module.prop $MODPATH/module.prop
+    $POSTFSDATA && cp -af $TMPDIR/post-fs-data.sh $MODPATH/post-fs-data.sh
+    $LATESTARTSERVICE && cp -af $TMPDIR/service.sh $MODPATH/service.sh
+
+    ui_print "- Setting permissions"
+    set_permissions
   else
-    newSizeM=$((reqSizeM / 32 * 32 + 64))
-    ui_print "- Creating $IMG with size ${newSizeM}M"
-    $MAGISKBIN/magisk imgtool create $IMG $newSizeM >&2
-    mount_snippet
+    print_title "$MODNAME" "by $MODAUTH"
+    print_title "Powered by Magisk"
+
+    unzip -o "$ZIPFILE" customize.sh -d $MODPATH >&2
+
+    if ! grep -q '^SKIPUNZIP=1$' $MODPATH/customize.sh 2>/dev/null; then
+      ui_print "- Extracting module files"
+      unzip -o "$ZIPFILE" -x 'META-INF/*' -d $MODPATH >&2
+
+      # Default permissions
+      set_perm_recursive $MODPATH 0 0 0755 0644
+    fi
+
+    # Load customization script
+    [ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh
   fi
+
+  # Handle replace folders
+  for TARGET in $REPLACE; do
+    ui_print "- Replace target: $TARGET"
+    mktouch $MODPATH$TARGET/.replace
+  done
+
+  if $BOOTMODE; then
+    # Update info for Magisk Manager
+    mktouch $NVBASE/modules/$MODID/update
+    cp -af $MODPATH/module.prop $NVBASE/modules/$MODID/module.prop
+  fi
+
+  # Copy over custom sepolicy rules
+  if [ -f $MODPATH/sepolicy.rule -a -e "$PERSISTDIR" ]; then
+    ui_print "- Installing custom sepolicy patch"
+    # Remove old recovery logs (which may be filling partition) to make room
+    rm -f $PERSISTDIR/cache/recovery/*
+    PERSISTMOD=$PERSISTDIR/magisk/$MODID
+    mkdir -p $PERSISTMOD
+    cp -af $MODPATH/sepolicy.rule $PERSISTMOD/sepolicy.rule || abort "! Insufficient partition size"
+  fi
+
+  # Remove stuffs that don't belong to modules
+  rm -rf \
+  $MODPATH/system/placeholder $MODPATH/customize.sh \
+  $MODPATH/README.md $MODPATH/.git* 2>/dev/null
+
+  cd /
+  $BOOTMODE || recovery_cleanup
+  rm -rf $TMPDIR
+
+  ui_print "- Done"
 }
 
-unmount_magisk_img() {
-  check_filesystem $IMG $MOUNTPATH
-  newSizeM=$((curUsedM / 32 * 32 + 64))
-  $MAGISKBIN/magisk imgtool umount $MOUNTPATH $MAGISKLOOP
-  if [ $curSizeM -gt $newSizeM ]; then
-    ui_print "- Shrinking $IMG to ${newSizeM}M"
-    $MAGISKBIN/magisk imgtool resize $IMG $newSizeM >&2
-  fi
-}
+##########
+# Presets
+##########
 
-find_manager_apk() {
-  APK=/data/adb/magisk.apk
-  [ -f $APK ] || APK=/data/magisk/magisk.apk
-  [ -f $APK ] || APK=/data/app/com.topjohnwu.magisk*/*.apk
-  if [ ! -f $APK ]; then
-    DBAPK=`magisk --sqlite "SELECT value FROM strings WHERE key='requester'" | cut -d= -f2`
-    [ -z "$DBAPK" ] || APK=/data/app/$DBAPK*/*.apk
-  fi
-}
+# Detect whether in boot mode
+[ -z $BOOTMODE ] && ps | grep zygote | grep -qv grep && BOOTMODE=true
+[ -z $BOOTMODE ] && ps -A 2>/dev/null | grep zygote | grep -qv grep && BOOTMODE=true
+[ -z $BOOTMODE ] && BOOTMODE=false
+
+NVBASE=/data/adb
+TMPDIR=/dev/tmp
+
+# Bootsigner related stuff
+BOOTSIGNERCLASS=a.a
+BOOTSIGNER='/system/bin/dalvikvm -Xnoimage-dex2oat -cp $APK $BOOTSIGNERCLASS'
+BOOTSIGNED=false
+
+resolve_vars

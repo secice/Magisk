@@ -1,6 +1,10 @@
 /* misc.cpp - Store all functions that are unable to be catagorized clearly
  */
- 
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/sysmacros.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,36 +12,12 @@
 #include <pwd.h>
 #include <unistd.h>
 #include <syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/sysmacros.h>
+#include <random>
+#include <string>
 
-#include "logging.h"
-#include "utils.h"
+#include <utils.hpp>
 
-unsigned get_shell_uid() {
-	struct passwd* ppwd = getpwnam("shell");
-	if (nullptr == ppwd)
-		return 2000;
-
-	return ppwd->pw_uid;
-}
-
-unsigned get_system_uid() {
-	struct passwd* ppwd = getpwnam("system");
-	if (nullptr == ppwd)
-		return 1000;
-
-	return ppwd->pw_uid;
-}
-
-unsigned get_radio_uid() {
-	struct passwd* ppwd = getpwnam("radio");
-	if (nullptr == ppwd)
-		return 1001;
-
-	return ppwd->pw_uid;
-}
+using namespace std;
 
 int fork_dont_care() {
 	int pid = xfork();
@@ -50,22 +30,43 @@ int fork_dont_care() {
 	return 0;
 }
 
-void gen_rand_str(char *buf, int len) {
-	const char base[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-	int urandom;
-	if (access("/dev/urandom", R_OK) == 0) {
-		urandom = xopen("/dev/urandom", O_RDONLY | O_CLOEXEC);
-	} else {
-		mknod("/urandom", S_IFCHR | 0666, makedev(1, 9));
-		urandom = xopen("/urandom", O_RDONLY | O_CLOEXEC);
-		unlink("/urandom");
+int fork_no_zombie() {
+	int pid = xfork();
+	if (pid)
+		return pid;
+	// Unblock all signals
+	sigset_t block_set;
+	sigfillset(&block_set);
+	pthread_sigmask(SIG_UNBLOCK, &block_set, nullptr);
+	prctl(PR_SET_PDEATHSIG, SIGTERM);
+	if (getppid() == 1)
+		exit(1);
+	return 0;
+}
+
+constexpr char ALPHANUM[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static bool seeded = false;
+static std::mt19937 gen;
+static std::uniform_int_distribution<int> dist(0, sizeof(ALPHANUM) - 2);
+int gen_rand_str(char *buf, int len, bool varlen) {
+	if (!seeded) {
+		if (access("/dev/urandom", F_OK) != 0)
+			mknod("/dev/urandom", 0600 | S_IFCHR, makedev(1, 9));
+		int fd = xopen("/dev/urandom", O_RDONLY | O_CLOEXEC);
+		unsigned seed;
+		xxread(fd, &seed, sizeof(seed));
+		gen.seed(seed);
+		close(fd);
+		seeded = true;
 	}
-	xxread(urandom, buf, len - 1);
-	close(urandom);
-	for (int i = 0; i < len - 1; ++i) {
-		buf[i] = base[buf[i] % (sizeof(base) - 1)];
+	if (varlen) {
+		std::uniform_int_distribution<int> len_dist(len / 2, len);
+		len = len_dist(gen);
 	}
+	for (int i = 0; i < len - 1; ++i)
+		buf[i] = ALPHANUM[dist(gen)];
 	buf[len - 1] = '\0';
+	return len - 1;
 }
 
 int strend(const char *s1, const char *s2) {
@@ -74,108 +75,26 @@ int strend(const char *s1, const char *s2) {
 	return strcmp(s1 + l1 - l2, s2);
 }
 
-/* Original source: https://opensource.apple.com/source/cvs/cvs-19/cvs/lib/getline.c
- * License: GPL 2 or later
- * Adjusted to match POSIX */
-#define MIN_CHUNK 64
-ssize_t __getdelim(char **lineptr, size_t *n, int delim, FILE *stream) {
-	size_t nchars_avail;
-	char *read_pos;
+int exec_command(exec_t &exec) {
+	int pipefd[] = {-1, -1};
+	int outfd = -1;
 
-	if (!lineptr || !n || !stream) {
-		errno = EINVAL;
+	if (exec.fd == -1) {
+		if (xpipe2(pipefd, O_CLOEXEC) == -1)
+			return -1;
+		outfd = pipefd[1];
+	} else if (exec.fd >= 0) {
+		outfd = exec.fd;
+	}
+
+	int pid = exec.fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
 		return -1;
-	}
-
-	if (!*lineptr) {
-		*n = MIN_CHUNK;
-		*lineptr = (char *) malloc(*n);
-		if (!*lineptr) {
-			errno = ENOMEM;
-			return -1;
-		}
-	}
-
-	nchars_avail = *n;
-	read_pos = *lineptr;
-
-	while (1) {
-		int save_errno;
-		int c = getc(stream);
-
-		save_errno = errno;
-
-		if (nchars_avail < 2) {
-			if (*n > MIN_CHUNK)
-				*n *= 2;
-			else
-				*n += MIN_CHUNK;
-
-			nchars_avail = *n + *lineptr - read_pos;
-			*lineptr = (char *) realloc(*lineptr, *n);
-			if (!*lineptr) {
-				errno = ENOMEM;
-				return -1;
-			}
-			read_pos = *n - nchars_avail + *lineptr;
-		}
-
-		if (ferror(stream)) {
-			errno = save_errno;
-			return -1;
-		}
-
-		if (c == EOF) {
-			if (read_pos == *lineptr)
-				return -1;
-			else
-				break;
-		}
-
-		*read_pos++ = c;
-		nchars_avail--;
-
-		if (c == delim)
-			break;
-	}
-
-	*read_pos = '\0';
-
-	return read_pos - *lineptr;
-}
-
-ssize_t __getline(char **lineptr, size_t *n, FILE *stream) {
-	return __getdelim(lineptr, n, '\n', stream);
-}
-
-int __fsetxattr(int fd, const char *name, const void *value, size_t size, int flags) {
-	return (int) syscall(__NR_fsetxattr, fd, name, value, size, flags);
-}
-
-/*
-   fd == nullptr -> Ignore output
-  *fd < 0     -> Open pipe and set *fd to the read end
-  *fd >= 0    -> STDOUT (or STDERR) will be redirected to *fd
-  *pre_exec   -> A callback function called after forking, before execvp
-*/
-int exec_array(bool err, int *fd, void (*pre_exec)(void), const char **argv) {
-	int pipefd[2], outfd = -1;
-
-	if (fd) {
-		if (*fd < 0) {
-			if (xpipe2(pipefd, O_CLOEXEC) == -1)
-				return -1;
-			outfd = pipefd[1];
-		} else {
-			outfd = *fd;
-		}
-	}
-
-	int pid = xfork();
-	if (pid != 0) {
-		if (fd && *fd < 0) {
-			// Give the read end and close write end
-			*fd = pipefd[0];
+	} else if (pid) {
+		if (exec.fd == -1) {
+			exec.fd = pipefd[0];
 			close(pipefd[1]);
 		}
 		return pid;
@@ -183,55 +102,118 @@ int exec_array(bool err, int *fd, void (*pre_exec)(void), const char **argv) {
 
 	if (outfd >= 0) {
 		xdup2(outfd, STDOUT_FILENO);
-		if (err)
+		if (exec.err)
 			xdup2(outfd, STDERR_FILENO);
 		close(outfd);
 	}
 
 	// Call the pre-exec callback
-	if (pre_exec)
-		pre_exec();
+	if (exec.pre_exec)
+		exec.pre_exec();
 
-	execve(argv[0], (char **) argv, environ);
-	PLOGE("execve %s", argv[0]);
-	return -1;
+	execve(exec.argv[0], (char **) exec.argv, environ);
+	PLOGE("execve %s", exec.argv[0]);
+	exit(-1);
 }
 
-static int v_exec_command(bool err, int *fd, void (*cb)(void), const char *argv0, va_list argv) {
-	// Collect va_list into vector
-	Vector<const char *> args;
-	args.push_back(argv0);
-	for (const char *arg = va_arg(argv, char*); arg; arg = va_arg(argv, char*))
-		args.push_back(arg);
-	args.push_back(nullptr);
-	int pid = exec_array(err, fd, cb, args.data());
-	return pid;
-}
-
-int exec_command_sync(const char *argv0, ...) {
-	va_list argv;
-	va_start(argv, argv0);
-	int pid, status;
-	pid = v_exec_command(false, nullptr, nullptr, argv0, argv);
-	va_end(argv);
+int exec_command_sync(exec_t &exec) {
+	int pid = exec_command(exec);
 	if (pid < 0)
-		return pid;
+		return -1;
+	int status;
 	waitpid(pid, &status, 0);
 	return WEXITSTATUS(status);
 }
 
-int exec_command(bool err, int *fd, void (*cb)(void), const char *argv0, ...) {
-	va_list argv;
-	va_start(argv, argv0);
-	int pid = v_exec_command(err, fd, cb, argv0, argv);
-	va_end(argv);
-	return pid;
+int new_daemon_thread(thread_entry entry, void *arg, const pthread_attr_t *attr) {
+	pthread_t thread;
+	int ret = xpthread_create(&thread, attr, entry, arg);
+	if (ret == 0)
+		pthread_detach(thread);
+	return ret;
 }
 
-char *strdup2(const char *s, size_t *size) {
-	size_t len = strlen(s) + 1;
-	char *buf = new char[len];
-	memcpy(buf, s, len);
-	if (size) *size = len;
-	return buf;
+static void *proxy_routine(void *fp) {
+	auto fn = reinterpret_cast<std::function<void()>*>(fp);
+	(*fn)();
+	delete fn;
+	return nullptr;
+}
+
+int new_daemon_thread(std::function<void()> &&entry) {
+	return new_daemon_thread(proxy_routine, new std::function<void()>(std::move(entry)));
+}
+
+static char *argv0;
+static size_t name_len;
+void init_argv0(int argc, char **argv) {
+	argv0 = argv[0];
+	name_len = (argv[argc - 1] - argv[0]) + strlen(argv[argc - 1]) + 1;
+}
+
+void set_nice_name(const char *name) {
+	memset(argv0, 0, name_len);
+	strlcpy(argv0, name, name_len);
+	prctl(PR_SET_NAME, name);
+}
+
+bool ends_with(const std::string_view &s1, const std::string_view &s2) {
+	unsigned l1 = s1.length();
+	unsigned l2 = s2.length();
+	return l1 < l2 ? false : s1.compare(l1 - l2, l2, s2) == 0;
+}
+
+/*
+ * Bionic's atoi runs through strtol().
+ * Use our own implementation for faster conversion.
+ */
+int parse_int(const char *s) {
+	int val = 0;
+	char c;
+	while ((c = *(s++))) {
+		if (c > '9' || c < '0')
+			return -1;
+		val = val * 10 + c - '0';
+	}
+	return val;
+}
+
+uint32_t binary_gcd(uint32_t u, uint32_t v) {
+	if (u == 0) return v;
+	if (v == 0) return u;
+	auto shift = __builtin_ctz(u | v);
+	u >>= __builtin_ctz(u);
+	do {
+		v >>= __builtin_ctz(v);
+		if (u > v) {
+			auto t = v;
+			v = u;
+			u = t;
+		}
+		v -= u;
+	} while (v != 0);
+	return u << shift;
+}
+
+int switch_mnt_ns(int pid) {
+	char mnt[32];
+	snprintf(mnt, sizeof(mnt), "/proc/%d/ns/mnt", pid);
+	if (access(mnt, R_OK) == -1) return 1; // Maybe process died..
+
+	int fd, ret;
+	fd = xopen(mnt, O_RDONLY);
+	if (fd < 0) return 1;
+	// Switch to its namespace
+	ret = xsetns(fd, 0);
+	close(fd);
+	return ret;
+}
+
+string &replace_all(string &str, string_view from, string_view to) {
+	size_t pos = 0;
+	while((pos = str.find(from, pos)) != string::npos) {
+		str.replace(pos, from.length(), to);
+		pos += to.length();
+	}
+	return str;
 }

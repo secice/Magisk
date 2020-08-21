@@ -1,6 +1,24 @@
 #include <string.h>
 
-#include "format.h"
+#include "format.hpp"
+
+std::map<std::string_view, format_t> name2fmt;
+Fmt2Name fmt2name;
+Fmt2Ext fmt2ext;
+
+class FormatInit {
+public:
+	FormatInit() {
+		name2fmt["gzip"] = GZIP;
+		name2fmt["xz"] = XZ;
+		name2fmt["lzma"] = LZMA;
+		name2fmt["bzip2"] = BZIP2;
+		name2fmt["lz4"] = LZ4;
+		name2fmt["lz4_legacy"] = LZ4_LEGACY;
+	}
+};
+
+static FormatInit init;
 
 #define MATCH(s) (len >= (sizeof(s) - 1) && memcmp(buf, s, sizeof(s) - 1) == 0)
 
@@ -9,11 +27,7 @@ format_t check_fmt(const void *buf, size_t len) {
 		return CHROMEOS;
 	} else if (MATCH(BOOT_MAGIC)) {
 		return AOSP;
-	} else if (MATCH(ELF32_MAGIC)) {
-		return ELF32;
-	} else if (MATCH(ELF64_MAGIC)) {
-		return ELF64;
-	} else if (MATCH(GZIP_MAGIC)) {
+	} else if (MATCH(GZIP1_MAGIC) || MATCH(GZIP2_MAGIC)) {
 		return GZIP;
 	} else if (MATCH(LZOP_MAGIC)) {
 		return LZOP;
@@ -24,14 +38,12 @@ format_t check_fmt(const void *buf, size_t len) {
 		return LZMA;
 	} else if (MATCH(BZIP_MAGIC)) {
 		return BZIP2;
-	} else if (MATCH(LZ4_MAGIC)) {
+	} else if (MATCH(LZ41_MAGIC) || MATCH(LZ42_MAGIC)) {
 		return LZ4;
 	} else if (MATCH(LZ4_LEG_MAGIC)) {
 		return LZ4_LEGACY;
 	} else if (MATCH(MTK_MAGIC)) {
 		return MTK;
-	} else if (MATCH(DTB_MAGIC)) {
-		return DTB;
 	} else if (MATCH(DHTB_MAGIC)) {
 		return DHTB;
 	} else if (MATCH(TEGRABLOB_MAGIC)) {
@@ -41,44 +53,49 @@ format_t check_fmt(const void *buf, size_t len) {
 	}
 }
 
-void get_fmt_name(format_t fmt, char *name) {
-	const char *s;
+const char *Fmt2Name::operator[](format_t fmt) {
 	switch (fmt) {
 		case CHROMEOS:
-			s = "chromeos";
-			break;
+			return "chromeos";
 		case AOSP:
-			s = "aosp";
-			break;
+			return "aosp";
 		case GZIP:
-			s = "gzip";
-			break;
+			return "gzip";
 		case LZOP:
-			s = "lzop";
-			break;
+			return "lzop";
 		case XZ:
-			s = "xz";
-			break;
+			return "xz";
 		case LZMA:
-			s = "lzma";
-			break;
+			return "lzma";
 		case BZIP2:
-			s = "bzip2";
-			break;
+			return "bzip2";
 		case LZ4:
-			s = "lz4";
-			break;
+			return "lz4";
 		case LZ4_LEGACY:
-			s = "lz4_legacy";
-			break;
+			return "lz4_legacy";
 		case MTK:
-			s = "mtk";
-			break;
-		case DTB:
-			s = "dtb";
-			break;
+			return "mtk";
 		default:
-			s = "raw";
+			return "raw";
 	}
-	strcpy(name, s);
+}
+
+const char *Fmt2Ext::operator[](format_t fmt) {
+	switch (fmt) {
+		case GZIP:
+			return ".gz";
+		case LZOP:
+			return ".lzo";
+		case XZ:
+			return ".xz";
+		case LZMA:
+			return ".lzma";
+		case BZIP2:
+			return ".bz2";
+		case LZ4:
+		case LZ4_LEGACY:
+			return ".lz4";
+		default:
+			return "";
+	}
 }

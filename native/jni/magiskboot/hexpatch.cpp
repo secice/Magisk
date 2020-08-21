@@ -3,8 +3,9 @@
 #include <string.h>
 #include <sys/mman.h>
 
-#include "magiskboot.h"
-#include "utils.h"
+#include <utils.hpp>
+
+#include "magiskboot.hpp"
 
 static void hex2byte(uint8_t *hex, uint8_t *str) {
 	char high, low;
@@ -15,11 +16,12 @@ static void hex2byte(uint8_t *hex, uint8_t *str) {
 	}
 }
 
-void hexpatch(const char *image, const char *from, const char *to) {
+int hexpatch(const char *image, const char *from, const char *to) {
 	int patternsize = strlen(from) / 2, patchsize = strlen(to) / 2;
+	int patched = 1;
 	size_t filesize;
 	uint8_t *file, *pattern, *patch;
-	mmap_rw(image, (void **) &file, &filesize);
+	mmap_rw(image, file, filesize);
 	pattern = (uint8_t *) xmalloc(patternsize);
 	patch = (uint8_t *) xmalloc(patchsize);
 	hex2byte((uint8_t *) from, pattern);
@@ -30,9 +32,12 @@ void hexpatch(const char *image, const char *from, const char *to) {
 			memset(file + i, 0, patternsize);
 			memcpy(file + i, patch, patchsize);
 			i += patternsize - 1;
+			patched = 0;
 		}
 	}
 	munmap(file, filesize);
 	free(pattern);
 	free(patch);
+
+	return patched;
 }

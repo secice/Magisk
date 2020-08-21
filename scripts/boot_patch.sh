@@ -1,5 +1,5 @@
 #!/system/bin/sh
-##########################################################################################
+###########################################################################################
 #
 # Magisk Boot Image Patcher
 # by topjohnwu
@@ -7,31 +7,27 @@
 # Usage: boot_patch.sh <bootimage>
 #
 # The following flags can be set in environment variables:
-# KEEPVERITY, KEEPFORCEENCRYPT
+# KEEPVERITY, KEEPFORCEENCRYPT, RECOVERYMODE
 #
 # This script should be placed in a directory with the following files:
 #
 # File name          Type      Description
 #
-# boot_patch.sh      script    A script to patch boot. Expect path to boot image as parameter.
+# boot_patch.sh      script    A script to patch boot image for Magisk.
 #                  (this file) The script will use binaries and files in its same directory
 #                              to complete the patching process
-# util_functions.sh  script    A script which hosts all functions requires for this script
+# util_functions.sh  script    A script which hosts all functions required for this script
 #                              to work properly
-# magiskinit         binary    The binary to replace /init, which has the magisk binary embedded
-# magiskboot         binary    A tool to unpack boot image, decompress ramdisk, extract ramdisk,
-#                              and patch the ramdisk for Magisk support
-# chromeos           folder    This folder should store all the utilities and keys to sign
-#                  (optional)  a chromeos device. Used for Pixel C
+# magiskinit         binary    The binary to replace /init; magisk binary embedded
+# magiskboot         binary    A tool to manipulate boot images
+# chromeos           folder    This folder includes all the utilities and keys to sign
+#                  (optional)  chromeos boot images. Currently only used for Pixel C
 #
-# If the script is not running as root, then the input boot image should be a stock image
-# or have a backup included in ramdisk internally, since we cannot access the stock boot
-# image placed under /data we've created when previously installed
-#
-##########################################################################################
-##########################################################################################
+###########################################################################################
+
+############
 # Functions
-##########################################################################################
+############
 
 # Pure bash dirname implementation
 getdir() {
@@ -41,9 +37,9 @@ getdir() {
   esac
 }
 
-##########################################################################################
+#################
 # Initialization
-##########################################################################################
+#################
 
 if [ -z $SOURCEDMODE ]; then
   # Switch to the location of the script file
@@ -58,120 +54,129 @@ BOOTIMAGE="$1"
 # Flags
 [ -z $KEEPVERITY ] && KEEPVERITY=false
 [ -z $KEEPFORCEENCRYPT ] && KEEPFORCEENCRYPT=false
+[ -z $RECOVERYMODE ] && RECOVERYMODE=false
+export KEEPVERITY
+export KEEPFORCEENCRYPT
 
 chmod -R 755 .
 
 # Extract magisk if doesn't exist
 [ -e magisk ] || ./magiskinit -x magisk magisk
 
-##########################################################################################
+#########
 # Unpack
-##########################################################################################
+#########
 
 CHROMEOS=false
 
 ui_print "- Unpacking boot image"
-./magiskboot --unpack "$BOOTIMAGE"
+./magiskboot unpack "$BOOTIMAGE"
 
 case $? in
   1 )
-    abort "! Unable to unpack boot image"
+    abort "! Unsupported/Unknown image format"
     ;;
   2 )
     ui_print "- ChromeOS boot image detected"
     CHROMEOS=true
     ;;
-  3 )
-    ui_print "! Sony ELF32 format detected"
-    abort "! Please use BootBridge from @AdrianDC to flash Magisk"
-    ;;
-  4 )
-    ui_print "! Sony ELF64 format detected"
-    abort "! Stock kernel cannot be patched, please use a custom kernel"
 esac
 
-##########################################################################################
-# Ramdisk restores
-##########################################################################################
+[ -f recovery_dtbo ] && RECOVERYMODE=true
 
-# Test patch status and do restore, after this section, ramdisk.cpio.orig is guaranteed to exist
+###################
+# Ramdisk Restores
+###################
+
+# Test patch status and do restore
 ui_print "- Checking ramdisk status"
-./magiskboot --cpio ramdisk.cpio test
-case $? in
+if [ -e ramdisk.cpio ]; then
+  ./magiskboot cpio ramdisk.cpio test
+  STATUS=$?
+else
+  # Stock A only system-as-root
+  STATUS=0
+fi
+case $((STATUS & 3)) in
   0 )  # Stock boot
     ui_print "- Stock boot image detected"
-    ui_print "- Backing up stock boot image"
-    SHA1=`./magiskboot --sha1 "$BOOTIMAGE" 2>/dev/null`
-    STOCKDUMP=stock_boot_${SHA1}.img.gz
-    ./magiskboot --compress "$BOOTIMAGE" $STOCKDUMP
-    cp -af ramdisk.cpio ramdisk.cpio.orig
+    SHA1=`./magiskboot sha1 "$BOOTIMAGE" 2>/dev/null`
+    cat $BOOTIMAGE > stock_boot.img
+    cp -af ramdisk.cpio ramdisk.cpio.orig 2>/dev/null
     ;;
   1 )  # Magisk patched
     ui_print "- Magisk patched boot image detected"
     # Find SHA1 of stock boot image
-    [ -z $SHA1 ] && SHA1=`./magiskboot --cpio ramdisk.cpio sha1 2>/dev/null`
-    ./magiskboot --cpio ramdisk.cpio restore
+    [ -z $SHA1 ] && SHA1=`./magiskboot cpio ramdisk.cpio sha1 2>/dev/null`
+    ./magiskboot cpio ramdisk.cpio restore
     cp -af ramdisk.cpio ramdisk.cpio.orig
     ;;
-  2 ) # Other patched
+  2 )  # Unsupported
     ui_print "! Boot image patched by unsupported programs"
-    abort "! Please restore stock boot image"
+    abort "! Please restore back to stock boot image"
     ;;
 esac
 
-##########################################################################################
-# Ramdisk patches
-##########################################################################################
+##################
+# Ramdisk Patches
+##################
 
 ui_print "- Patching ramdisk"
 
 echo "KEEPVERITY=$KEEPVERITY" > config
 echo "KEEPFORCEENCRYPT=$KEEPFORCEENCRYPT" >> config
+echo "RECOVERYMODE=$RECOVERYMODE" >> config
 [ ! -z $SHA1 ] && echo "SHA1=$SHA1" >> config
 
-./magiskboot --cpio ramdisk.cpio \
+./magiskboot cpio ramdisk.cpio \
 "add 750 init magiskinit" \
-"patch $KEEPVERITY $KEEPFORCEENCRYPT" \
+"patch" \
 "backup ramdisk.cpio.orig" \
+"mkdir 000 .backup" \
 "add 000 .backup/.magisk config"
+
+if [ $((STATUS & 4)) -ne 0 ]; then
+  ui_print "- Compressing ramdisk"
+  ./magiskboot cpio ramdisk.cpio compress
+fi
 
 rm -f ramdisk.cpio.orig config
 
-##########################################################################################
-# Binary patches
-##########################################################################################
+#################
+# Binary Patches
+#################
 
-if ! $KEEPVERITY; then
-  [ -f dtb ] && ./magiskboot --dtb-patch dtb && ui_print "- Removing dm(avb)-verity in dtb"
-  [ -f extra ] && ./magiskboot --dtb-patch extra && ui_print "- Removing dm(avb)-verity in extra-dtb"
-fi
+for dt in dtb kernel_dtb extra recovery_dtbo; do
+  [ -f $dt ] && ./magiskboot dtb $dt patch && ui_print "- Patch fstab in $dt"
+done
 
 if [ -f kernel ]; then
   # Remove Samsung RKP
-  ./magiskboot --hexpatch kernel \
+  ./magiskboot hexpatch kernel \
   49010054011440B93FA00F71E9000054010840B93FA00F7189000054001840B91FA00F7188010054 \
   A1020054011440B93FA00F7140020054010840B93FA00F71E0010054001840B91FA00F7181010054
 
   # Remove Samsung defex
   # Before: [mov w2, #-221]   (-__NR_execve)
   # After:  [mov w2, #-32768]
-  ./magiskboot --hexpatch kernel 821B8012 E2FF8F12
+  ./magiskboot hexpatch kernel 821B8012 E2FF8F12
 
   # Force kernel to load rootfs
   # skip_initramfs -> want_initramfs
-  ./magiskboot --hexpatch kernel \
+  ./magiskboot hexpatch kernel \
   736B69705F696E697472616D667300 \
   77616E745F696E697472616D667300
 fi
 
-##########################################################################################
-# Repack and flash
-##########################################################################################
+#################
+# Repack & Flash
+#################
 
 ui_print "- Repacking boot image"
-./magiskboot --repack "$BOOTIMAGE" || abort "! Unable to repack boot image!"
+./magiskboot repack "$BOOTIMAGE" || abort "! Unable to repack boot image!"
 
 # Sign chromeos boot
 $CHROMEOS && sign_chromeos
 
-./magiskboot --cleanup
+# Reset any error code
+true

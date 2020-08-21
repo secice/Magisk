@@ -1,137 +1,212 @@
-/*
-** Copyright 2018, John Wu (@topjohnwu)
-** Copyright 2010, Adam Shanks (@ChainsDD)
-** Copyright 2008, Zinx Verituse (@zinxv)
-**
-*/
-
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <stdio.h>
 
-#include "magisk.h"
-#include "daemon.h"
-#include "utils.h"
-#include "su.h"
+#include <daemon.hpp>
+#include <utils.hpp>
 
-#define AM_PATH "/system/bin/app_process", "/system/bin", "com.android.commands.am.Am"
+#include "su.hpp"
 
-static const char *get_command(const struct su_request *to) {
-	if (to->command[0])
-		return to->command;
-	if (to->shell[0])
-		return to->shell;
-	return DEFAULT_SHELL;
+using namespace std;
+
+enum {
+	NAMED_ACTIVITY,
+	PKG_ACTIVITY,
+	CONTENT_PROVIDER
+};
+
+#define CALL_PROVIDER \
+"/system/bin/app_process", "/system/bin", "com.android.commands.content.Content", \
+"call", "--uri", target, "--user", user, "--method", action
+
+#define START_ACTIVITY \
+"/system/bin/app_process", "/system/bin", "com.android.commands.am.Am", \
+"start", "-p", target, "--user", user, "-a", "android.intent.action.VIEW", \
+"-f", "0x18000020", "--es", "action", action
+
+// 0x18000020 = FLAG_ACTIVITY_NEW_TASK|FLAG_ACTIVITY_MULTIPLE_TASK|FLAG_INCLUDE_STOPPED_PACKAGES
+
+#define get_user(info) \
+(info->cfg[SU_MULTIUSER_MODE] == MULTIUSER_MODE_USER \
+? info->uid / 100000 : 0)
+
+#define get_cmd(to) \
+(to.command[0] ? to.command : to.shell[0] ? to.shell : DEFAULT_SHELL)
+
+class Extra {
+	const char *key;
+	enum {
+		INT,
+		BOOL,
+		STRING
+	} type;
+	union {
+		int int_val;
+		bool bool_val;
+		const char * str_val;
+	};
+	char buf[32];
+public:
+	Extra(const char *k, int v): key(k), type(INT), int_val(v) {}
+	Extra(const char *k, bool v): key(k), type(BOOL), bool_val(v) {}
+	Extra(const char *k, const char *v): key(k), type(STRING), str_val(v) {}
+
+	void add_intent(vector<const char *> &vec) {
+		const char *val;
+		switch (type) {
+			case INT:
+				vec.push_back("--ei");
+				sprintf(buf, "%d", int_val);
+				val = buf;
+				break;
+			case BOOL:
+				vec.push_back("--ez");
+				val = bool_val ? "true" : "false";
+				break;
+			case STRING:
+				vec.push_back("--es");
+				val = str_val;
+				break;
+		}
+		vec.push_back(key);
+		vec.push_back(val);
+	}
+
+	void add_bind(vector<const char *> &vec) {
+		switch (type) {
+			case INT:
+				sprintf(buf, "%s:i:%d", key, int_val);
+				break;
+			case BOOL:
+				sprintf(buf, "%s:b:%s", key, bool_val ? "true" : "false");
+				break;
+			case STRING:
+				sprintf(buf, "%s:s:%s", key, str_val);
+				break;
+		}
+		vec.push_back("--extra");
+		vec.push_back(buf);
+	}
+};
+
+static bool check_no_error(int fd) {
+	char buf[1024];
+	auto out = xopen_file(fd, "r");
+	while (fgets(buf, sizeof(buf), out.get())) {
+		if (strncmp(buf, "Error", 5) == 0)
+			return false;
+	}
+	return true;
 }
 
-static void silent_run(const char *args[]) {
-	if (fork_dont_care())
-		return;
-	int zero = open("/dev/zero", O_RDONLY | O_CLOEXEC);
-	xdup2(zero, 0);
-	int null = open("/dev/null", O_WRONLY | O_CLOEXEC);
-	xdup2(null, 1);
-	xdup2(null, 2);
-	setenv("CLASSPATH", "/system/framework/am.jar", 1);
-	execv(args[0], (char **) args);
-	PLOGE("exec am");
-	_exit(EXIT_FAILURE);
+static void exec_cmd(const char *action, vector<Extra> &data,
+					 const shared_ptr<su_info> &info, int mode = CONTENT_PROVIDER) {
+	char target[128];
+	char user[4];
+	sprintf(user, "%d", get_user(info));
+
+	// First try content provider call method
+	if (mode >= CONTENT_PROVIDER) {
+		sprintf(target, "content://%s.provider", info->str[SU_MANAGER].data());
+		vector<const char *> args{ CALL_PROVIDER };
+		for (auto &e : data) {
+			e.add_bind(args);
+		}
+		args.push_back(nullptr);
+		exec_t exec {
+			.err = true,
+			.fd = -1,
+			.pre_exec = [] { setenv("CLASSPATH", "/system/framework/content.jar", 1); },
+			.argv = args.data()
+		};
+		exec_command_sync(exec);
+		if (check_no_error(exec.fd))
+			return;
+	}
+
+	vector<const char *> args{ START_ACTIVITY };
+	for (auto &e : data) {
+		e.add_intent(args);
+	}
+	args.push_back(nullptr);
+	exec_t exec {
+		.err = true,
+		.fd = -1,
+		.pre_exec = [] { setenv("CLASSPATH", "/system/framework/am.jar", 1); },
+		.argv = args.data()
+	};
+
+	if (mode >= PKG_ACTIVITY) {
+		// Then try start activity without component name
+		strcpy(target, info->str[SU_MANAGER].data());
+		exec_command_sync(exec);
+		if (check_no_error(exec.fd))
+			return;
+	}
+
+	// Finally, fallback to start activity with component name
+	args[4] = "-n";
+	sprintf(target, "%s/a.m", info->str[SU_MANAGER].data());
+	exec.fd = -2;
+	exec.fork = fork_dont_care;
+	exec_command(exec);
 }
 
-static void setup_user(char *user, struct su_info *info) {
-	switch (info->cfg[SU_MULTIUSER_MODE]) {
-		case MULTIUSER_MODE_OWNER_ONLY:
-		case MULTIUSER_MODE_OWNER_MANAGED:
-			sprintf(user, "%d", 0);
-			break;
-		case MULTIUSER_MODE_USER:
-			sprintf(user, "%d", info->uid / 100000);
-			break;
+void app_log(const su_context &ctx) {
+	if (fork_dont_care() == 0) {
+		vector<Extra> extras;
+		extras.reserve(6);
+		extras.emplace_back("from.uid", ctx.info->uid);
+		extras.emplace_back("to.uid", ctx.req.uid);
+		extras.emplace_back("pid", ctx.pid);
+		extras.emplace_back("policy", ctx.info->access.policy);
+		extras.emplace_back("command", get_cmd(ctx.req));
+		extras.emplace_back("notify", (bool) ctx.info->access.notify);
+
+		exec_cmd("log", extras, ctx.info);
+		exit(0);
 	}
 }
 
-void app_log(struct su_context *ctx) {
-	char user[8];
-	setup_user(user, ctx->info);
+void app_notify(const su_context &ctx) {
+	if (fork_dont_care() == 0) {
+		vector<Extra> extras;
+		extras.reserve(2);
+		extras.emplace_back("from.uid", ctx.info->uid);
+		extras.emplace_back("policy", ctx.info->access.policy);
 
-	char fromUid[8];
-	sprintf(fromUid, "%d",
-			ctx->info->cfg[SU_MULTIUSER_MODE] == MULTIUSER_MODE_OWNER_MANAGED ?
-			ctx->info->uid % 100000 : ctx->info->uid);
-
-	char toUid[8];
-	sprintf(toUid, "%d", ctx->req.uid);
-
-	char pid[8];
-	sprintf(pid, "%d", ctx->pid);
-
-	char policy[2];
-	sprintf(policy, "%d", ctx->info->access.policy);
-
-	const char *cmd[] = {
-		AM_PATH, "broadcast",
-		"-a", "android.intent.action.BOOT_COMPLETED",
-		"-p", ctx->info->str[SU_MANAGER],
-		"-f", "0x00000020",
-		"--user", user,
-		"--es", "action", "log",
-		"--ei", "from.uid", fromUid,
-		"--ei", "to.uid", toUid,
-		"--ei", "pid", pid,
-		"--ei", "policy", policy,
-		"--es", "command", get_command(&ctx->req),
-		"--ez", "notify", ctx->info->access.notify ? "true" : "false",
-		nullptr
-	};
-	silent_run(cmd);
+		exec_cmd("notify", extras, ctx.info);
+		exit(0);
+	}
 }
 
-void app_notify(struct su_context *ctx) {
-	char user[8];
-	setup_user(user, ctx->info);
+int app_socket(const char *name, const shared_ptr<su_info> &info) {
+	vector<Extra> extras;
+	extras.reserve(1);
+	extras.emplace_back("socket", name);
 
-	char fromUid[8];
-	sprintf(fromUid, "%d",
-			ctx->info->cfg[SU_MULTIUSER_MODE] == MULTIUSER_MODE_OWNER_MANAGED ?
-			ctx->info->uid % 100000 : ctx->info->uid);
+	exec_cmd("request", extras, info, PKG_ACTIVITY);
 
-	char policy[2];
-	sprintf(policy, "%d", ctx->info->access.policy);
-
-	const char *cmd[] = {
-			AM_PATH, "broadcast",
-			"-a", "android.intent.action.BOOT_COMPLETED",
-			"-p", ctx->info->str[SU_MANAGER],
-			"-f", "0x00000020",
-			"--user", user,
-			"--es", "action", "notify",
-			"--ei", "from.uid", fromUid,
-			"--ei", "policy", policy,
-			nullptr
-	};
-	silent_run(cmd);
+	sockaddr_un addr;
+	size_t len = setup_sockaddr(&addr, name);
+	int fd = xsocket(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	bool connected = false;
+	// Try at most 60 seconds
+	for (int i = 0; i < 600; ++i) {
+		if (connect(fd, reinterpret_cast<sockaddr *>(&addr), len) == 0) {
+			connected = true;
+			break;
+		}
+		usleep(100000);  // 100ms
+	}
+	if (connected) {
+		return fd;
+	} else {
+		close(fd);
+		return -1;
+	}
 }
 
-void app_connect(const char *socket, struct su_info *info) {
-	char user[8];
-	setup_user(user, info);
-	const char *cmd[] = {
-		AM_PATH, "broadcast",
-		"-a", "android.intent.action.BOOT_COMPLETED",
-		"-p", info->str[SU_MANAGER],
-		"-f", "0x00000020",
-		"--user", user,
-		"--es", "action", "request",
-		"--es", "socket", socket,
-		nullptr
-	};
-	silent_run(cmd);
-}
-
-void socket_send_request(int fd, struct su_info *info) {
+void socket_send_request(int fd, const shared_ptr<su_info> &info) {
 	write_key_token(fd, "uid", info->uid);
 	write_string_be(fd, "eof");
 }
